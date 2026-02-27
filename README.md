@@ -1,5 +1,8 @@
 # Claude Code Terminal for Unity
 
+MIT licensed.
+
+
 A Unity Editor tool that embeds a Claude Code interface directly inside the Unity Editor. Type natural language commands in Unity and Claude Code executes them, with full access to your project files and the Unity Editor via MCP (Model Context Protocol).
 
 Claude Code can read your scene hierarchy, create and edit scripts, manage GameObjects and components, read the console, and perform virtually any editor operation -- all from a text prompt inside Unity.

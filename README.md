@@ -28,7 +28,7 @@ Before starting, make sure you have the following installed:
 4. **Git** (for installing the Unity package via git URL)
 
 
-## Step 1: Install MCP for Unity
+## Step 1: Install MCP for Unity (per Unity project)
 
 This provides the bridge between Claude Code and the Unity Editor.
 
@@ -45,7 +45,7 @@ https://github.com/CoplayDev/unity-mcp.git?path=/MCPForUnity#main
 Wait for the package to import.
 
 
-## Step 2: Start the MCP Server
+## Step 2: Start the MCP Server (per editing session)
 
 1. In Unity, go to **Window > MCP for Unity > Toggle MCP Window**
 2. In the MCP panel that opens, click **Start Server**
@@ -55,7 +55,7 @@ Wait for the package to import.
 The server runs on `http://127.0.0.1:8080` by default. Leave the terminal window open.
 
 
-## Step 3: Register the MCP Server with Claude Code
+## Step 3: Register the MCP Server with Claude Code (once only)
 
 Open a PowerShell or terminal window (not inside Claude Code) and run:
 
@@ -68,7 +68,7 @@ This registers the Unity MCP server globally so Claude Code can access it from a
 To register for a single project only, use `--scope local` instead and run the command from your Unity project root directory.
 
 
-## Step 4: Authenticate Claude Code
+## Step 4: Authenticate Claude Code (check per session, to avoid API charges)
 
 If you have not already authenticated Claude Code:
 
@@ -89,7 +89,7 @@ $env:ANTHROPIC_API_KEY = $null
 ```
 
 
-## Step 5: Install the Editor Tool
+## Step 5: Install the Editor Tool (once per project)
 
 1. In your Unity project, create a folder: `Assets/Editor/` (if it does not already exist)
 2. Copy `ClaudeCodeTerminal.cs` into `Assets/Editor/`
@@ -97,7 +97,7 @@ $env:ANTHROPIC_API_KEY = $null
 4. Open the tool via **Window > Claude Code Terminal**
 
 
-## Step 6: Add the CLAUDE.md File
+## Step 6: Add the CLAUDE.md File (once per project)
 
 Copy the provided `CLAUDE.md` file into your Unity project root directory (the folder containing `Assets/`, `ProjectSettings/`, etc.).
 
@@ -106,11 +106,11 @@ This file contains project-level instructions that Claude Code reads automatical
 You can edit this file at any time to add project-specific instructions.
 
 
-## Usage
+## Usage (every session)
 
-1. Make sure the MCP server is running in Unity (Step 2)
-2. Open the Claude Code Terminal via **Window > Claude Code Terminal**
-3. Type a command in the input field at the bottom and press **Enter** or click **Send**
+1. Start the MCP server running in Unity (Step 2 of Prerequisites)
+2. Open the Claude Code Terminal via Unity menus **Window > Claude Code Terminal**
+3. Type a command in the input field at the bottom and press **Enter** (twice) or click **Send**
 
 Example commands:
 
@@ -219,5 +219,6 @@ This would auto-approve MCP tool calls and file edits but block other operations
 ## How It Works
 
 The editor tool spawns a `claude -p` (headless mode) process for each prompt, with the working directory set to your Unity project root. Claude Code picks up the `.mcp.json` or user-level MCP config and gains access to all unity-mcp tools. Responses stream back via `--output-format stream-json` and are displayed in the editor window. Session IDs are captured and reused via `--resume` to maintain conversational context across multiple prompts.
+WARNING: the claude instance is started with highly permissive settings to avoid permission requests in the Claude terminal (which will not be reflected inside Unity, causing an unexplained pause until you find the cause). Beware! External materials (text files, images, etc) may try to abuse these permissions to hijack your machine.
 
 The MCP for Unity package runs an HTTP server inside the Unity Editor process that exposes editor operations as MCP tools. Claude Code calls these tools over HTTP to read and modify the scene, create scripts, manage components, and perform other editor actions.

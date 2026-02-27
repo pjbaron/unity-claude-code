@@ -39,6 +39,14 @@ namespace ClaudeCodeBridge
         private StringBuilder _currentAssistantMsg = new StringBuilder();
         private GUIStyle _logAreaStyle;
         private bool _stylesReady;
+        private double _lastOutputTime;
+
+        private const string kPrefTimeout = "ClaudeCodeTerminal_TimeoutSec";
+        private const int kDefaultTimeout = 120;
+
+        private const string kPrefShowCost = "ClaudeCodeTerminal_ShowCost";
+        private const string kPrefShowTurns = "ClaudeCodeTerminal_ShowTurns";
+        private const string kPrefShowContext = "ClaudeCodeTerminal_ShowContext";
         [SerializeField] private string _logText = "";
 
         // ------------------------------------------------------------------
@@ -136,6 +144,14 @@ namespace ClaudeCodeBridge
                 menu.AddSeparator("");
                 menu.AddItem(new GUIContent("Configure CLI Path..."), false, ShowCLIPathDialog);
                 menu.AddItem(new GUIContent("Set Max Turns..."), false, ShowMaxTurnsDialog);
+                menu.AddItem(new GUIContent("Set Timeout..."), false, ShowTimeoutDialog);
+                menu.AddSeparator("");
+                menu.AddItem(new GUIContent("Summary/Show Cost"), EditorPrefs.GetBool(kPrefShowCost, false),
+                    () => EditorPrefs.SetBool(kPrefShowCost, !EditorPrefs.GetBool(kPrefShowCost, false)));
+                menu.AddItem(new GUIContent("Summary/Show Turns"), EditorPrefs.GetBool(kPrefShowTurns, true),
+                    () => EditorPrefs.SetBool(kPrefShowTurns, !EditorPrefs.GetBool(kPrefShowTurns, true)));
+                menu.AddItem(new GUIContent("Summary/Show Context"), EditorPrefs.GetBool(kPrefShowContext, true),
+                    () => EditorPrefs.SetBool(kPrefShowContext, !EditorPrefs.GetBool(kPrefShowContext, true)));
                 menu.ShowAsContext();
             }
 
@@ -179,19 +195,34 @@ namespace ClaudeCodeBridge
             GUI.SetNextControlName("ClaudeInput");
             _inputText = EditorGUILayout.TextField(_inputText, GUILayout.ExpandWidth(true));
 
-            // Use KeyUp - TextField consumes the first KeyDown for text commit
-            bool enterPressed = Event.current.type == EventType.KeyUp &&
-                                (Event.current.keyCode == KeyCode.Return || Event.current.keyCode == KeyCode.KeypadEnter) &&
-                                GUI.GetNameOfFocusedControl() == "ClaudeInput";
-
-            bool submit = GUILayout.Button("Send", GUILayout.Width(60)) || enterPressed;
-
-            if (submit && !string.IsNullOrWhiteSpace(_inputText) && !_isRunning)
+            if (_isRunning)
             {
-                SendPrompt(_inputText.Trim());
-                _inputText = "";
-                GUI.FocusControl("ClaudeInput");
-                Event.current.Use();
+                // Show Cancel button while a request is in flight
+                var oldBg = GUI.backgroundColor;
+                GUI.backgroundColor = new Color(0.9f, 0.3f, 0.3f);
+                if (GUILayout.Button("Cancel", GUILayout.Width(60)))
+                {
+                    KillProcess();
+                    AddLog("[cancelled by user]", 3);
+                }
+                GUI.backgroundColor = oldBg;
+            }
+            else
+            {
+                // Use KeyUp - TextField consumes the first KeyDown for text commit
+                bool enterPressed = Event.current.type == EventType.KeyUp &&
+                                    (Event.current.keyCode == KeyCode.Return || Event.current.keyCode == KeyCode.KeypadEnter) &&
+                                    GUI.GetNameOfFocusedControl() == "ClaudeInput";
+
+                bool submit = GUILayout.Button("Send", GUILayout.Width(60)) || enterPressed;
+
+                if (submit && !string.IsNullOrWhiteSpace(_inputText))
+                {
+                    SendPrompt(_inputText.Trim());
+                    _inputText = "";
+                    GUI.FocusControl("ClaudeInput");
+                    Event.current.Use();
+                }
             }
 
             EditorGUILayout.EndHorizontal();
@@ -241,6 +272,7 @@ namespace ClaudeCodeBridge
                 _proc.Exited += OnProcessExited;
                 _proc.Start();
                 _isRunning = true;
+                _lastOutputTime = EditorApplication.timeSinceStartup;
                 _currentAssistantMsg.Clear();
 
                 _readerThread = new Thread(ReadOutputStream) { IsBackground = true };
@@ -289,6 +321,7 @@ namespace ClaudeCodeBridge
                     string line;
                     while ((line = reader.ReadLine()) != null)
                     {
+                        _lastOutputTime = EditorApplication.timeSinceStartup;
                         string captured = line;
                         QueueMainThread(() => AddLog("[stderr] " + captured, 2));
                     }
@@ -302,6 +335,9 @@ namespace ClaudeCodeBridge
         // ------------------------------------------------------------------
         private void ProcessStreamLine(string json)
         {
+            // Any output from the process resets the timeout clock
+            _lastOutputTime = EditorApplication.timeSinceStartup;
+
             // stream-json emits newline-delimited JSON objects.
             // Key message types:
             //   {"type":"init", ...}                        - session start
@@ -341,14 +377,40 @@ namespace ClaudeCodeBridge
                     string turns = ExtractJsonString(json, "num_turns");
                     string subtype = ExtractJsonString(json, "subtype");
 
+                    // Context window usage - available in the result JSON under usage
+                    string inputTokens = ExtractJsonString(json, "input_tokens");
+                    string outputTokens = ExtractJsonString(json, "output_tokens");
+
                     QueueMainThread(() =>
                     {
                         if (!string.IsNullOrEmpty(sid))
                             _sessionId = sid;
 
                         string info = "[done";
-                        if (!string.IsNullOrEmpty(cost)) info += " | cost: $" + cost;
-                        if (!string.IsNullOrEmpty(turns)) info += " | turns: " + turns;
+
+                        if (EditorPrefs.GetBool(kPrefShowCost, false) && !string.IsNullOrEmpty(cost))
+                            info += " | cost: $" + cost;
+
+                        if (EditorPrefs.GetBool(kPrefShowTurns, true) && !string.IsNullOrEmpty(turns))
+                            info += " | turns: " + turns;
+
+                        // Report context usage if token counts are available
+                        if (EditorPrefs.GetBool(kPrefShowContext, true) &&
+                            !string.IsNullOrEmpty(inputTokens) && !string.IsNullOrEmpty(outputTokens))
+                        {
+                            long inTok, outTok;
+                            if (long.TryParse(inputTokens, out inTok) && long.TryParse(outputTokens, out outTok))
+                            {
+                                long used = inTok + outTok;
+                                // Claude Code models: Sonnet/Opus = 200k context window
+                                long contextWindow = 200000;
+                                long remaining = contextWindow - used;
+                                float pct = (float)remaining / contextWindow * 100f;
+                                info += string.Format(" | context: {0:N0}/{1:N0} remaining ({2:F0}%)",
+                                    remaining, contextWindow, pct);
+                            }
+                        }
+
                         if (subtype == "error") info += " | ERROR";
                         info += "]";
                         AddLog(info, 3);
@@ -652,6 +714,39 @@ namespace ClaudeCodeBridge
         {
             if (_isRunning || _mainThreadQueue.Count > 0)
                 Repaint();
+
+            // Timeout check
+            if (_isRunning && _lastOutputTime > 0)
+            {
+                int timeout = EditorPrefs.GetInt(kPrefTimeout, kDefaultTimeout);
+                if (timeout > 0)
+                {
+                    double elapsed = EditorApplication.timeSinceStartup - _lastOutputTime;
+                    if (elapsed >= timeout)
+                    {
+                        KillProcess();
+                        AddLog(string.Format("[timed out after {0}s with no output - killed]", timeout), 2);
+                    }
+                }
+            }
+        }
+
+        private void ShowTimeoutDialog()
+        {
+            int current = EditorPrefs.GetInt(kPrefTimeout, kDefaultTimeout);
+            var menu = new GenericMenu();
+            int[] options = { 0, 30, 60, 120, 180, 300 };
+            foreach (int opt in options)
+            {
+                int val = opt;
+                string label = val == 0 ? "Disabled" : val + "s";
+                menu.AddItem(new GUIContent(label), current == val, () =>
+                {
+                    EditorPrefs.SetInt(kPrefTimeout, val);
+                    AddLog("Timeout set to: " + (val == 0 ? "disabled" : val + "s"), 3);
+                });
+            }
+            menu.ShowAsContext();
         }
     }
 }

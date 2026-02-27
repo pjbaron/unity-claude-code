@@ -36,8 +36,8 @@ When changing default values of serialized fields ([SerializeField], public fiel
 
 ## Edit Consequences
 
-- After editing any C# script, wait 30 seconds before calling any MCP tools.
-- Unity domain reload will temporarily disconnect the MCP bridge during the rebuild.
+- After editing any C# script, DO NOT call refresh_unity. Unity auto-detects file changes and recompiles.
+- After a script edit, wait at least 30 seconds before calling any MCP tools. Unity domain reload will temporarily disconnect the MCP bridge.
 - If an MCP tool call fails, retry it after a short pause with exponential fallback.
 
 ## Component Properties

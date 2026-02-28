@@ -42,7 +42,7 @@ namespace ClaudeCodeBridge
         private double _lastOutputTime;
 
         private const string kPrefTimeout = "ClaudeCodeTerminal_TimeoutSec";
-        private const int kDefaultTimeout = 120;
+        private const int kDefaultTimeout = 600;
 
         private const string kPrefShowCost = "ClaudeCodeTerminal_ShowCost";
         private const string kPrefShowTurns = "ClaudeCodeTerminal_ShowTurns";
@@ -264,8 +264,17 @@ namespace ClaudeCodeBridge
                 StandardErrorEncoding = Encoding.UTF8,
             };
 
-            // Inherit environment (picks up PATH, ANTHROPIC_API_KEY, etc.)
-            // Ensure MCP config is found from project root
+            // Strip ANTHROPIC_API_KEY so Claude Code uses the interactive
+            // login (Max subscription) instead of billing against API credits.
+            // Setting anything on psi.Environment disables automatic inheritance,
+            // so we copy everything else across explicitly.
+            foreach (System.Collections.DictionaryEntry entry in Environment.GetEnvironmentVariables())
+            {
+                string key = entry.Key.ToString();
+                if (string.Equals(key, "ANTHROPIC_API_KEY", StringComparison.OrdinalIgnoreCase))
+                    continue;
+                psi.Environment[key] = entry.Value?.ToString() ?? "";
+            }
             try
             {
                 _proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
@@ -734,19 +743,67 @@ namespace ClaudeCodeBridge
         private void ShowTimeoutDialog()
         {
             int current = EditorPrefs.GetInt(kPrefTimeout, kDefaultTimeout);
-            var menu = new GenericMenu();
-            int[] options = { 0, 30, 60, 120, 180, 300 };
-            foreach (int opt in options)
+            TimeoutInputWindow.Show(current, (val) =>
             {
-                int val = opt;
-                string label = val == 0 ? "Disabled" : val + "s";
-                menu.AddItem(new GUIContent(label), current == val, () =>
-                {
-                    EditorPrefs.SetInt(kPrefTimeout, val);
-                    AddLog("Timeout set to: " + (val == 0 ? "disabled" : val + "s"), 3);
-                });
+                EditorPrefs.SetInt(kPrefTimeout, val);
+                AddLog("Timeout set to: " + (val == 0 ? "disabled" : val + "s"), 3);
+                Repaint();
+            });
+        }
+    }
+
+    public class TimeoutInputWindow : EditorWindow
+    {
+        private string _value;
+        private Action<int> _callback;
+        private bool _focusSet;
+
+        public static void Show(int current, Action<int> callback)
+        {
+            var w = CreateInstance<TimeoutInputWindow>();
+            w.titleContent = new GUIContent("Set Timeout");
+            w._value = current.ToString();
+            w._callback = callback;
+            w._focusSet = false;
+            w.minSize = new Vector2(260, 80);
+            w.maxSize = new Vector2(260, 80);
+            w.ShowUtility();
+        }
+
+        private void OnGUI()
+        {
+            EditorGUILayout.LabelField("Seconds of inactivity (0 = disabled):");
+            GUI.SetNextControlName("TimeoutField");
+            _value = EditorGUILayout.TextField(_value);
+
+            if (!_focusSet)
+            {
+                EditorGUI.FocusTextInControl("TimeoutField");
+                _focusSet = true;
             }
-            menu.ShowAsContext();
+
+            bool enterPressed = Event.current.type == EventType.KeyUp &&
+                                (Event.current.keyCode == KeyCode.Return || Event.current.keyCode == KeyCode.KeypadEnter);
+
+            EditorGUILayout.BeginHorizontal();
+            GUILayout.FlexibleSpace();
+            bool ok = GUILayout.Button("OK", GUILayout.Width(60)) || enterPressed;
+            bool cancel = GUILayout.Button("Cancel", GUILayout.Width(60));
+            EditorGUILayout.EndHorizontal();
+
+            if (ok)
+            {
+                int result;
+                if (int.TryParse(_value, out result) && result >= 0)
+                {
+                    _callback?.Invoke(result);
+                    Close();
+                }
+            }
+            else if (cancel)
+            {
+                Close();
+            }
         }
     }
 }

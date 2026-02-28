@@ -216,9 +216,27 @@ This would auto-approve MCP tool calls and file edits but block other operations
 | `CLAUDE.md` | Project root | Instructions for Claude Code on how to work with Unity |
 
 
+## Subsequent New Projects
+
+After you've installed everything and validated it's working with your first project, you might want to build something new.
+
+- Create the unity project from the Hub
+- Use Window|Install TextMeshPro Essential Resources (to avoid problems later, the dialog can lock up an otherwise perfect build)
+- Install the Unity MCP server from PackageManager: 
+```
+https://github.com/CoplayDev/unity-mcp.git?path=/MCPForUnity#main
+```
+- Start the MCP server with Window|MCP For Unity|Toggle MCP Window, then press the 'Start Server' button
+- Start the Claude Code Terminal with Window|Claude Code Terminal
+- Type in your prototype design prompt!
+
+
 ## How It Works
 
 The editor tool spawns a `claude -p` (headless mode) process for each prompt, with the working directory set to your Unity project root. Claude Code picks up the `.mcp.json` or user-level MCP config and gains access to all unity-mcp tools. Responses stream back via `--output-format stream-json` and are displayed in the editor window. Session IDs are captured and reused via `--resume` to maintain conversational context across multiple prompts.
 WARNING: the claude instance is started with highly permissive settings to avoid permission requests in the Claude terminal (which will not be reflected inside Unity, causing an unexplained pause until you find the cause). Beware! External materials (text files, images, etc) may try to abuse these permissions to hijack your machine.
 
 The MCP for Unity package runs an HTTP server inside the Unity Editor process that exposes editor operations as MCP tools. Claude Code calls these tools over HTTP to read and modify the scene, create scripts, manage components, and perform other editor actions.
+
+Notes:
+- Don't change any source files manually whilst running: the editor will rebuild and that will trigger a restart of the Terminal which can interupt the current process.

@@ -475,6 +475,10 @@ namespace ClaudeCodeBridge
                                 AddLog("[session: " + sid.Substring(0, Mathf.Min(8, sid.Length)) + "...]", 3);
                             });
                         }
+                        // After init, the next thing Claude Code does is send the prompt
+                        // to the API. No rate_limit_event is emitted on the first turn,
+                        // so switch to THINKING now.
+                        _activityState = 1;
                     }
                     return;
                 }

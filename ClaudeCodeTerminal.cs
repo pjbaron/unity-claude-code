@@ -41,20 +41,34 @@ namespace ClaudeCodeBridge
         private bool _stylesReady;
         private double _lastOutputTime;
 
+        // Activity state for status indicator
+        // 0=idle, 1=thinking (after rate_limit_event), 2=tool (after tool_use), 3=starting
+        private int _activityState;
+        private string _activeToolName;
+        private bool _sessionCompleted; // true once we receive a "result" message
+
         // ------------------------------------------------------------------
-        // Debug instrumentation
+        // Debug instrumentation -- DO NOT REMOVE until fix is verified
         // ------------------------------------------------------------------
         private const string kDbg = "[CCT-DBG]";
         private int _stdoutLineCount;
         private int _stderrLineCount;
-        private int _queuedActionCount;
         private double _processStartTimestamp;
+        private double _lastHeartbeatTime;
 
         private static string Elapsed(double since)
         {
             double now = Stopwatch.GetTimestamp() / (double)Stopwatch.Frequency;
             return string.Format("{0:F3}s", now - since);
         }
+
+        // ------------------------------------------------------------------
+        // Domain reload recovery
+        // ------------------------------------------------------------------
+        private const string kPrefInterrupted = "ClaudeCodeTerminal_WasInterrupted";
+        private const string kPrefInterruptedSession = "ClaudeCodeTerminal_InterruptedSessionId";
+        private const string kPrefAutoResume = "ClaudeCodeTerminal_AutoResume";
+        private bool _pendingAutoResume;
 
         private const string kPrefTimeout = "ClaudeCodeTerminal_TimeoutSec";
         private const int kDefaultTimeout = 600;
@@ -126,12 +140,45 @@ namespace ClaudeCodeBridge
             EditorGUILayout.BeginHorizontal(EditorStyles.toolbar);
 
             // Status indicator
-            string status = _isRunning ? "  WORKING..." : "  IDLE";
-            Color col = _isRunning ? Color.yellow : Color.green;
+            string status;
+            Color col;
+            if (!_isRunning)
+            {
+                status = "  IDLE";
+                col = Color.green;
+            }
+            else
+            {
+                switch (_activityState)
+                {
+                    case 1:
+                        status = "  THINKING...";
+                        col = new Color(0.4f, 0.7f, 1.0f); // light blue
+                        break;
+                    case 2:
+                        status = "  TOOL...";
+                        col = new Color(1.0f, 0.6f, 0.2f); // orange
+                        break;
+                    default:
+                        status = "  WORKING...";
+                        col = Color.yellow;
+                        break;
+                }
+            }
             var oldCol = GUI.contentColor;
             GUI.contentColor = col;
             GUILayout.Label(status, EditorStyles.toolbarButton, GUILayout.Width(100));
             GUI.contentColor = oldCol;
+
+            // Show active tool name when waiting for a tool
+            if (_isRunning && _activityState == 2 && !string.IsNullOrEmpty(_activeToolName))
+            {
+                string shortTool = _activeToolName;
+                // Strip mcp__unityMCP__ prefix for readability
+                if (shortTool.StartsWith("mcp__unityMCP__"))
+                    shortTool = shortTool.Substring(15);
+                GUILayout.Label(shortTool, EditorStyles.miniLabel, GUILayout.MaxWidth(160));
+            }
 
             if (GUILayout.Button("Clear", EditorStyles.toolbarButton, GUILayout.Width(45)))
             {
@@ -167,6 +214,9 @@ namespace ClaudeCodeBridge
                     () => EditorPrefs.SetBool(kPrefShowTurns, !EditorPrefs.GetBool(kPrefShowTurns, true)));
                 menu.AddItem(new GUIContent("Summary/Show Context"), EditorPrefs.GetBool(kPrefShowContext, true),
                     () => EditorPrefs.SetBool(kPrefShowContext, !EditorPrefs.GetBool(kPrefShowContext, true)));
+                menu.AddSeparator("");
+                menu.AddItem(new GUIContent("Auto-resume after recompile"), EditorPrefs.GetBool(kPrefAutoResume, true),
+                    () => EditorPrefs.SetBool(kPrefAutoResume, !EditorPrefs.GetBool(kPrefAutoResume, true)));
                 menu.ShowAsContext();
             }
 
@@ -249,11 +299,10 @@ namespace ClaudeCodeBridge
         private void SendPrompt(string prompt)
         {
             AddLog("> " + prompt, 1);
-            Debug.Log(string.Format("{0} SendPrompt called, isRunning={1}, sessionId={2}",
+            Debug.Log(string.Format("{0} SendPrompt: isRunning={1}, sessionId={2}",
                 kDbg, _isRunning, string.IsNullOrEmpty(_sessionId) ? "(none)" : _sessionId));
 
             string projectPath = Path.GetDirectoryName(Application.dataPath);
-            Debug.Log(string.Format("{0} WorkingDirectory={1}", kDbg, projectPath));
 
             var args = new StringBuilder();
             args.Append("-p ");
@@ -286,40 +335,32 @@ namespace ClaudeCodeBridge
 
             // Strip ANTHROPIC_API_KEY so Claude Code uses the interactive
             // login (Max subscription) instead of billing against API credits.
-            // Accessing psi.Environment auto-populates from the parent process,
-            // then we can just remove the offending key.
-            var env = psi.Environment;
-            env.Remove("ANTHROPIC_API_KEY");
+            psi.Environment.Remove("ANTHROPIC_API_KEY");
+
             try
             {
-                Debug.Log(string.Format("{0} ANTHROPIC_API_KEY present in parent env: {1}",
-                    kDbg, Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY") != null));
-
                 _proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
                 _proc.Exited += OnProcessExited;
                 _proc.Start();
 
                 _processStartTimestamp = Stopwatch.GetTimestamp() / (double)Stopwatch.Frequency;
                 _isRunning = true;
+                _activityState = 3;
+                _activeToolName = null;
+                _sessionCompleted = false;
                 _lastOutputTime = _processStartTimestamp;
+                _lastHeartbeatTime = 0;
                 _stdoutLineCount = 0;
                 _stderrLineCount = 0;
-                _queuedActionCount = 0;
                 _currentAssistantMsg.Clear();
 
-                Debug.Log(string.Format("{0} Process started: PID={1}, isRunning -> true",
-                    kDbg, _proc.Id));
+                Debug.Log(string.Format("{0} Process started: PID={1}", kDbg, _proc.Id));
 
                 _readerThread = new Thread(ReadOutputStream) { IsBackground = true, Name = "CCT-StdoutReader" };
                 _readerThread.Start();
-                Debug.Log(string.Format("{0} Stdout reader thread started (ManagedThreadId={1})",
-                    kDbg, _readerThread.ManagedThreadId));
 
-                // Capture stderr on another thread
                 var errThread = new Thread(ReadErrorStream) { IsBackground = true, Name = "CCT-StderrReader" };
                 errThread.Start();
-                Debug.Log(string.Format("{0} Stderr reader thread started (ManagedThreadId={1})",
-                    kDbg, errThread.ManagedThreadId));
             }
             catch (Exception ex)
             {
@@ -335,7 +376,7 @@ namespace ClaudeCodeBridge
         // ------------------------------------------------------------------
         private void ReadOutputStream()
         {
-            Debug.Log(string.Format("{0} [stdout-thread] ENTER ReadOutputStream", kDbg));
+            Debug.Log(string.Format("{0} [stdout-thread] ENTER", kDbg));
             try
             {
                 using (var reader = _proc.StandardOutput)
@@ -344,22 +385,20 @@ namespace ClaudeCodeBridge
                     while (true)
                     {
                         int lineNum = _stdoutLineCount;
-                        Debug.Log(string.Format("{0} [stdout-thread] BLOCKING on ReadLine (after line #{1}, +{2})",
+                        Debug.Log(string.Format("{0} [stdout] BLOCKING ReadLine (after #{1}, +{2})",
                             kDbg, lineNum, Elapsed(_processStartTimestamp)));
 
                         line = reader.ReadLine();
 
                         if (line == null)
                         {
-                            Debug.Log(string.Format("{0} [stdout-thread] ReadLine returned NULL (EOF), +{1}",
-                                kDbg, Elapsed(_processStartTimestamp)));
+                            Debug.Log(string.Format("{0} [stdout] EOF, +{1}", kDbg, Elapsed(_processStartTimestamp)));
                             break;
                         }
 
                         _stdoutLineCount++;
-                        // Log a truncated version so we can see what arrived without flooding
                         string preview = line.Length > 200 ? line.Substring(0, 200) + "..." : line;
-                        Debug.Log(string.Format("{0} [stdout-thread] LINE #{1} ({2} chars, +{3}): {4}",
+                        Debug.Log(string.Format("{0} [stdout] #{1} ({2}ch, +{3}): {4}",
                             kDbg, _stdoutLineCount, line.Length, Elapsed(_processStartTimestamp), preview));
 
                         ProcessStreamLine(line);
@@ -368,16 +407,16 @@ namespace ClaudeCodeBridge
             }
             catch (Exception ex)
             {
-                Debug.LogError(string.Format("{0} [stdout-thread] EXCEPTION: {1}", kDbg, ex));
+                Debug.LogError(string.Format("{0} [stdout] EXCEPTION: {1}", kDbg, ex));
                 QueueMainThread(() => AddLog("Read error: " + ex.Message, 2));
             }
-            Debug.Log(string.Format("{0} [stdout-thread] EXIT ReadOutputStream (total lines: {1}, +{2})",
+            Debug.Log(string.Format("{0} [stdout] EXIT (total: {1} lines, +{2})",
                 kDbg, _stdoutLineCount, Elapsed(_processStartTimestamp)));
         }
 
         private void ReadErrorStream()
         {
-            Debug.Log(string.Format("{0} [stderr-thread] ENTER ReadErrorStream", kDbg));
+            Debug.Log(string.Format("{0} [stderr-thread] ENTER", kDbg));
             try
             {
                 using (var reader = _proc.StandardError)
@@ -388,18 +427,17 @@ namespace ClaudeCodeBridge
                         _stderrLineCount++;
                         _lastOutputTime = Stopwatch.GetTimestamp() / (double)Stopwatch.Frequency;
                         string captured = line;
-                        int count = _stderrLineCount;
-                        Debug.Log(string.Format("{0} [stderr-thread] LINE #{1} (+{2}): {3}",
-                            kDbg, count, Elapsed(_processStartTimestamp), captured));
+                        Debug.Log(string.Format("{0} [stderr] #{1} (+{2}): {3}",
+                            kDbg, _stderrLineCount, Elapsed(_processStartTimestamp), captured));
                         QueueMainThread(() => AddLog("[stderr] " + captured, 2));
                     }
                 }
             }
             catch (Exception ex)
             {
-                Debug.LogError(string.Format("{0} [stderr-thread] EXCEPTION: {1}", kDbg, ex));
+                Debug.LogError(string.Format("{0} [stderr] EXCEPTION: {1}", kDbg, ex));
             }
-            Debug.Log(string.Format("{0} [stderr-thread] EXIT ReadErrorStream (total lines: {1}, +{2})",
+            Debug.Log(string.Format("{0} [stderr] EXIT (total: {1} lines, +{2})",
                 kDbg, _stderrLineCount, Elapsed(_processStartTimestamp)));
         }
 
@@ -408,7 +446,6 @@ namespace ClaudeCodeBridge
         // ------------------------------------------------------------------
         private void ProcessStreamLine(string json)
         {
-            // Any output from the process resets the timeout clock
             _lastOutputTime = Stopwatch.GetTimestamp() / (double)Stopwatch.Frequency;
 
             try
@@ -417,38 +454,46 @@ namespace ClaudeCodeBridge
                 Debug.Log(string.Format("{0} ProcessStreamLine: type=\"{1}\" (+{2})",
                     kDbg, msgType ?? "(null)", Elapsed(_processStartTimestamp)));
 
-                if (msgType == "init")
+                if (msgType == "system")
                 {
-                    string sid = ExtractJsonString(json, "session_id");
-                    Debug.Log(string.Format("{0}   init: session_id={1}", kDbg, sid ?? "(null)"));
-                    if (!string.IsNullOrEmpty(sid))
+                    string subtype = ExtractJsonString(json, "subtype");
+                    Debug.Log(string.Format("{0}   system: subtype={1}", kDbg, subtype ?? "(null)"));
+
+                    if (subtype == "init")
                     {
-                        QueueMainThread(() =>
+                        string sid = ExtractJsonString(json, "session_id");
+                        Debug.Log(string.Format("{0}   system/init: session_id={1}", kDbg, sid ?? "(null)"));
+                        if (!string.IsNullOrEmpty(sid))
                         {
+                            // Write session_id immediately on reader thread so it's
+                            // available for OnBeforeAssemblyReload even if main thread
+                            // queue hasn't drained yet. String ref assignment is atomic in C#.
                             _sessionId = sid;
-                            AddLog("[session: " + sid.Substring(0, Mathf.Min(8, sid.Length)) + "...]", 3);
-                        });
+                            Debug.Log(string.Format("{0}   system/init: _sessionId set IMMEDIATELY (not queued)", kDbg));
+                            QueueMainThread(() =>
+                            {
+                                AddLog("[session: " + sid.Substring(0, Mathf.Min(8, sid.Length)) + "...]", 3);
+                            });
+                        }
                     }
                     return;
                 }
 
                 if (msgType == "result")
                 {
-                    Debug.Log(string.Format("{0}   result: flushing assistant buffer", kDbg));
-                    // Flush any accumulated assistant text
+                    _sessionCompleted = true;
                     FlushAssistantBuffer();
 
+                    Debug.Log(string.Format("{0}   result: session marked COMPLETED", kDbg));
                     string sid = ExtractJsonString(json, "session_id");
                     string cost = ExtractJsonString(json, "total_cost_usd");
                     string turns = ExtractJsonString(json, "num_turns");
                     string subtype = ExtractJsonString(json, "subtype");
-
-                    // Context window usage - available in the result JSON under usage
                     string inputTokens = ExtractJsonString(json, "input_tokens");
                     string outputTokens = ExtractJsonString(json, "output_tokens");
 
-                    Debug.Log(string.Format("{0}   result: subtype={1}, turns={2}, cost={3}, inTok={4}, outTok={5}",
-                        kDbg, subtype, turns, cost, inputTokens, outputTokens));
+                    Debug.Log(string.Format("{0}   result: subtype={1}, turns={2}, cost={3}",
+                        kDbg, subtype, turns, cost));
 
                     QueueMainThread(() =>
                     {
@@ -463,7 +508,6 @@ namespace ClaudeCodeBridge
                         if (EditorPrefs.GetBool(kPrefShowTurns, true) && !string.IsNullOrEmpty(turns))
                             info += " | turns: " + turns;
 
-                        // Report context usage if token counts are available
                         if (EditorPrefs.GetBool(kPrefShowContext, true) &&
                             !string.IsNullOrEmpty(inputTokens) && !string.IsNullOrEmpty(outputTokens))
                         {
@@ -471,7 +515,6 @@ namespace ClaudeCodeBridge
                             if (long.TryParse(inputTokens, out inTok) && long.TryParse(outputTokens, out outTok))
                             {
                                 long used = inTok + outTok;
-                                // Claude Code models: Sonnet/Opus = 200k context window
                                 long contextWindow = 200000;
                                 long remaining = contextWindow - used;
                                 float pct = (float)remaining / contextWindow * 100f;
@@ -489,31 +532,27 @@ namespace ClaudeCodeBridge
 
                 if (msgType == "assistant")
                 {
-                    // Extract text content from the nested message.
                     string content = ExtractContentText(json);
-                    bool hasContent = !string.IsNullOrEmpty(content);
-
-                    // Show tool use as status
                     string toolName = ExtractToolUse(json);
-                    bool hasTool = !string.IsNullOrEmpty(toolName);
 
-                    Debug.Log(string.Format("{0}   assistant: hasText={1} (len={2}), hasTool={3}, toolName={4}",
-                        kDbg, hasContent, content != null ? content.Length : 0, hasTool, toolName ?? "(none)"));
+                    Debug.Log(string.Format("{0}   assistant: hasText={1}, toolName={2}",
+                        kDbg, !string.IsNullOrEmpty(content), toolName ?? "(none)"));
 
-                    if (hasContent)
+                    if (!string.IsNullOrEmpty(content))
                     {
                         lock (_lock)
                         {
                             _currentAssistantMsg.Append(content);
                         }
-                        // Flush periodically so the user sees streaming output
                         FlushAssistantBuffer();
                     }
 
-                    if (hasTool)
+                    if (!string.IsNullOrEmpty(toolName))
                     {
-                        Debug.Log(string.Format("{0}   >> TOOL_USE dispatched: {1} -- next ReadLine will BLOCK until tool completes",
+                        Debug.Log(string.Format("{0}   >> TOOL_USE: {1} -- ReadLine will BLOCK until tool completes",
                             kDbg, toolName));
+                        _activityState = 2;
+                        _activeToolName = toolName;
                         QueueMainThread(() => AddLog("[tool: " + toolName + "]", 3));
                     }
                     return;
@@ -524,17 +563,15 @@ namespace ClaudeCodeBridge
                     string errMsg = ExtractJsonString(json, "error");
                     if (string.IsNullOrEmpty(errMsg)) errMsg = json;
                     string captured = errMsg;
-                    Debug.LogError(string.Format("{0}   error message: {1}", kDbg, captured));
+                    Debug.LogError(string.Format("{0}   error: {1}", kDbg, captured));
                     QueueMainThread(() => AddLog("Error: " + captured, 2));
                     return;
                 }
 
-                // For other message types (user, tool_result, etc.)
                 if (msgType == "tool_result")
                 {
                     bool isError = json.Contains("\"is_error\":true") || json.Contains("\"is_error\": true");
-                    Debug.Log(string.Format("{0}   tool_result: is_error={1}, json_len={2}",
-                        kDbg, isError, json.Length));
+                    Debug.Log(string.Format("{0}   tool_result: is_error={1}", kDbg, isError));
 
                     if (isError)
                     {
@@ -542,15 +579,19 @@ namespace ClaudeCodeBridge
                         if (!string.IsNullOrEmpty(errContent))
                         {
                             string captured = errContent;
-                            Debug.LogError(string.Format("{0}   tool_result ERROR content: {1}", kDbg, captured));
                             QueueMainThread(() => AddLog("[tool error] " + captured, 2));
                         }
                     }
+                    return;
                 }
-                else
+
+                if (msgType == "rate_limit_event")
                 {
-                    // Log any unhandled message types so we know what we're ignoring
-                    Debug.Log(string.Format("{0}   (unhandled message type: \"{1}\")", kDbg, msgType ?? "(null)"));
+                    // This is the last message before Claude Code sends the API request.
+                    // Silence after this = model is thinking.
+                    _activityState = 1;
+                    _activeToolName = null;
+                    return;
                 }
             }
             catch (Exception ex)
@@ -585,8 +626,7 @@ namespace ClaudeCodeBridge
             FlushAssistantBuffer();
             QueueMainThread(() =>
             {
-                Debug.Log(string.Format("{0} OnProcessExited [main-thread]: setting isRunning=false (was {1})",
-                    kDbg, _isRunning));
+                Debug.Log(string.Format("{0} OnProcessExited [main-thread]: isRunning -> false", kDbg));
                 _isRunning = false;
                 Repaint();
             });
@@ -599,19 +639,20 @@ namespace ClaudeCodeBridge
 
         private void KillProcess()
         {
-            Debug.Log(string.Format("{0} KillProcess called: proc={1}, hasExited={2}",
-                kDbg,
-                _proc != null ? _proc.Id.ToString() : "(null)",
-                _proc != null && !_proc.HasExited ? "false" : "true"));
+            bool wasAlive = _proc != null;
+            bool hadExited = true;
+            try { hadExited = _proc == null || _proc.HasExited; } catch { }
 
-            if (_proc != null && !_proc.HasExited)
+            Debug.Log(string.Format("{0} KillProcess: proc={1}, hadExited={2}",
+                kDbg, wasAlive ? _proc.Id.ToString() : "(null)", hadExited));
+
+            if (_proc != null && !hadExited)
             {
                 try { _proc.Kill(); Debug.Log(string.Format("{0} KillProcess: Kill() sent", kDbg)); }
                 catch (Exception ex) { Debug.LogWarning(string.Format("{0} KillProcess: Kill() failed: {1}", kDbg, ex.Message)); }
             }
             _proc = null;
             _isRunning = false;
-            Debug.Log(string.Format("{0} KillProcess: isRunning -> false, proc -> null", kDbg));
         }
 
         // ------------------------------------------------------------------
@@ -621,35 +662,18 @@ namespace ClaudeCodeBridge
         {
             lock (_lock)
             {
-                _queuedActionCount++;
                 _mainThreadQueue.Enqueue(action);
             }
         }
 
         private void ProcessMainThreadQueue()
         {
-            int count;
-            lock (_lock)
-            {
-                count = _mainThreadQueue.Count;
-            }
-
-            if (count > 0)
-            {
-                Debug.Log(string.Format("{0} ProcessMainThreadQueue: draining {1} actions", kDbg, count));
-            }
-
             lock (_lock)
             {
                 while (_mainThreadQueue.Count > 0)
                 {
                     var action = _mainThreadQueue.Dequeue();
-                    try { action(); }
-                    catch (Exception ex)
-                    {
-                        Debug.LogException(ex);
-                        Debug.LogError(string.Format("{0} ProcessMainThreadQueue: action threw: {1}", kDbg, ex.Message));
-                    }
+                    try { action(); } catch (Exception ex) { Debug.LogException(ex); }
                 }
             }
             // Keep repainting while a process is active so streaming text appears
@@ -815,52 +839,160 @@ namespace ClaudeCodeBridge
         }
 
         // ------------------------------------------------------------------
-        // Periodic update to pump the main-thread queue even when
-        // OnGUI isn't firing (e.g. window not focused)
+        // Lifecycle - domain reload resilience
         // ------------------------------------------------------------------
         private void OnEnable()
         {
             EditorApplication.update += EditorUpdate;
+            AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
+
+            // Check if we were interrupted by a domain reload
+            if (EditorPrefs.GetBool(kPrefInterrupted, false))
+            {
+                EditorPrefs.DeleteKey(kPrefInterrupted);
+                string savedSession = EditorPrefs.GetString(kPrefInterruptedSession, "");
+                EditorPrefs.DeleteKey(kPrefInterruptedSession);
+
+                Debug.Log(string.Format("{0} OnEnable: RELOAD RECOVERY - savedSession={1}, serializedSession={2}",
+                    kDbg, string.IsNullOrEmpty(savedSession) ? "(empty)" : savedSession,
+                    string.IsNullOrEmpty(_sessionId) ? "(empty)" : _sessionId));
+
+                // Restore session id if we lost it during reload
+                if (!string.IsNullOrEmpty(savedSession) && string.IsNullOrEmpty(_sessionId))
+                {
+                    _sessionId = savedSession;
+                    Debug.Log(string.Format("{0} OnEnable: restored _sessionId from EditorPrefs", kDbg));
+                }
+
+                // Clean up stale runtime state from before reload
+                _isRunning = false;
+                _proc = null;
+
+                AddLog("[session interrupted by recompile/domain reload]", 2);
+
+                if (EditorPrefs.GetBool(kPrefAutoResume, true) && !string.IsNullOrEmpty(_sessionId))
+                {
+                    AddLog("[auto-resuming session...]", 3);
+                    _pendingAutoResume = true;
+                    Debug.Log(string.Format("{0} OnEnable: auto-resume queued for session {1}", kDbg, _sessionId));
+                }
+                else
+                {
+                    Debug.Log(string.Format("{0} OnEnable: NOT auto-resuming. autoResume={1}, hasSession={2}",
+                        kDbg, EditorPrefs.GetBool(kPrefAutoResume, true), !string.IsNullOrEmpty(_sessionId)));
+                }
+            }
+            else
+            {
+                Debug.Log(string.Format("{0} OnEnable: normal startup (no interrupted flag)", kDbg));
+            }
         }
 
         private void OnDisable()
         {
             EditorApplication.update -= EditorUpdate;
+            AssemblyReloadEvents.beforeAssemblyReload -= OnBeforeAssemblyReload;
         }
 
-        private double _lastStatusLogTime;
+        private void OnBeforeAssemblyReload()
+        {
+            Debug.Log(string.Format("{0} OnBeforeAssemblyReload: isRunning={1}, proc={2}, sessionId={3}, completed={4}",
+                kDbg, _isRunning,
+                _proc != null ? _proc.Id.ToString() : "(null)",
+                string.IsNullOrEmpty(_sessionId) ? "(empty)" : _sessionId,
+                _sessionCompleted));
+
+            if (!_isRunning && _proc == null) return;
+
+            // If the session already completed (got a "result" message),
+            // don't treat this as an interruption. Just clean up.
+            if (_sessionCompleted)
+            {
+                Debug.Log(string.Format("{0} OnBeforeAssemblyReload: session already completed, just cleaning up (no auto-resume)", kDbg));
+                KillProcess();
+                return;
+            }
+
+            // Persist enough state to resume after reload
+            EditorPrefs.SetBool(kPrefInterrupted, true);
+            if (!string.IsNullOrEmpty(_sessionId))
+            {
+                EditorPrefs.SetString(kPrefInterruptedSession, _sessionId);
+                Debug.Log(string.Format("{0} OnBeforeAssemblyReload: saved sessionId={1} to EditorPrefs", kDbg, _sessionId));
+            }
+            else
+            {
+                Debug.LogWarning(string.Format("{0} OnBeforeAssemblyReload: NO SESSION ID to save!", kDbg));
+            }
+
+            // Kill cleanly before Unity aborts our threads
+            KillProcess();
+        }
 
         private void EditorUpdate()
         {
             if (_isRunning || _mainThreadQueue.Count > 0)
                 Repaint();
 
-            // Periodic status heartbeat while running (every 30s)
+            // Auto-resume after domain reload (deferred one frame so GUI is ready)
+            if (_pendingAutoResume)
+            {
+                _pendingAutoResume = false;
+                Debug.Log(string.Format("{0} EditorUpdate: firing auto-resume for session {1}", kDbg, _sessionId));
+                if (!string.IsNullOrEmpty(_sessionId))
+                {
+                    SendPrompt("The Unity editor just performed a domain reload (script recompilation) which interrupted your previous action. Please check the current state and continue where you left off.");
+                }
+            }
+
+            // Orphan detection - safety net for cases where beforeAssemblyReload
+            // didn't fire or something else killed the process unexpectedly
+            if (_isRunning && _proc != null)
+            {
+                bool procDead;
+                try { procDead = _proc.HasExited; }
+                catch { procDead = true; }
+
+                bool threadDead = _readerThread == null || !_readerThread.IsAlive;
+
+                if (procDead && threadDead)
+                {
+                    Debug.LogWarning(string.Format("{0} [ORPHAN] proc and reader dead but isRunning=true, cleaning up", kDbg));
+                    _proc = null;
+                    _isRunning = false;
+                    AddLog("[session lost unexpectedly - process died]", 2);
+                    return;
+                }
+            }
+
+            // Heartbeat + timeout while running
             if (_isRunning && _lastOutputTime > 0)
             {
                 double now = Stopwatch.GetTimestamp() / (double)Stopwatch.Frequency;
                 double silentFor = now - _lastOutputTime;
 
-                if (now - _lastStatusLogTime >= 30.0)
+                // 30-second heartbeat
+                if (now - _lastHeartbeatTime >= 30.0)
                 {
-                    _lastStatusLogTime = now;
-                    bool procAlive = _proc != null && !_proc.HasExited;
+                    _lastHeartbeatTime = now;
+                    bool procAlive = false;
+                    try { procAlive = _proc != null && !_proc.HasExited; } catch { }
                     bool readerAlive = _readerThread != null && _readerThread.IsAlive;
                     int queueSize;
                     lock (_lock) { queueSize = _mainThreadQueue.Count; }
 
                     Debug.LogWarning(string.Format(
-                        "{0} [HEARTBEAT] silent for {1:F1}s | proc alive={2} | stdout thread alive={3} | queue={4} | total stdout lines={5} | +{6}",
-                        kDbg, silentFor, procAlive, readerAlive, queueSize, _stdoutLineCount, Elapsed(_processStartTimestamp)));
+                        "{0} [HEARTBEAT] silent={1:F1}s | proc={2} | stdout-thread={3} | queue={4} | lines={5}",
+                        kDbg, silentFor, procAlive ? "alive" : "DEAD",
+                        readerAlive ? "alive" : "DEAD", queueSize, _stdoutLineCount));
                 }
 
                 // Timeout check
                 int timeout = EditorPrefs.GetInt(kPrefTimeout, kDefaultTimeout);
                 if (timeout > 0 && silentFor >= timeout)
                 {
-                    Debug.LogError(string.Format(
-                        "{0} TIMEOUT: {1:F1}s since last output (limit={2}s). Killing process. Total stdout lines received: {3}",
-                        kDbg, silentFor, timeout, _stdoutLineCount));
+                    Debug.LogError(string.Format("{0} TIMEOUT: {1:F1}s (limit={2}s), killing",
+                        kDbg, silentFor, timeout));
                     KillProcess();
                     AddLog(string.Format("[timed out after {0}s with no output - killed]", timeout), 2);
                 }

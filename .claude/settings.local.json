@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__unityMCP__script_apply_edits"
+    ]
+  }
+}

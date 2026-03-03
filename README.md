@@ -7,6 +7,8 @@ A Unity Editor tool that embeds a Claude Code interface directly inside the Unit
 
 Claude Code can read your scene hierarchy, create and edit scripts, manage GameObjects and components, read the console, and perform virtually any editor operation -- all from a text prompt inside Unity.
 
+![Example](example.jpg)
+
 ## Prerequisites
 
 Before starting, make sure you have the following installed:
